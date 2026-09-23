@@ -22,6 +22,10 @@
   可用体积）+ 目标终体积与各溶质目标浓度，以精确有理数求满足全部目标
   浓度的非负母液取用量（母液总量最小、再按输入顺序字典序最小），
   余量用水补足，返回各母液取用量、补水量与最终浓度；
+* ``POST /isotopes/envelope`` 同位素名义质量峰分布：输入化学式与每种
+  元素各同位素的质量数与丰度，按独立原子抽样枚举全部名义质量组合
+  （同质量合并、不截断低概率项），返回按质量升序的全部峰（最简分数
+  概率）与概率最高峰（并列取质量较小者）；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -40,6 +44,8 @@ from .models import (
     BalanceResponse,
     BlendRequest,
     BlendResponse,
+    IsotopeEnvelopeRequest,
+    IsotopeEnvelopeResponse,
     ReactionRequest,
     ReversePlanRequest,
     ReversePlanResponse,
@@ -59,6 +65,7 @@ from .service import (
     process_analyze,
     process_balance,
     process_blend,
+    process_isotope_envelope,
     process_reverse_plan,
     process_sequence,
     process_stoichiometry,
@@ -270,6 +277,27 @@ async def solutions_blend(request: BlendRequest):
         [item.model_dump() for item in request.stocks],
         request.target_volume,
         [item.model_dump() for item in request.targets],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/isotopes/envelope",
+    response_model=IsotopeEnvelopeResponse,
+    tags=["同位素"],
+    summary="同位素名义质量峰分布：独立原子抽样枚举全部质量峰，最简分数概率",
+    responses={
+        400: {"description": "化学式无法解析"},
+        422: {"description": "电子物种 / 元素或原子数超限 / 同位素定义非法"},
+    },
+)
+async def isotopes_envelope(request: IsotopeEnvelopeRequest):
+    status, payload = process_isotope_envelope(
+        request.formula,
+        {
+            element: [item.model_dump() for item in entries]
+            for element, entries in request.isotopes.items()
+        },
     )
     return JSONResponse(status_code=status, content=payload)
 

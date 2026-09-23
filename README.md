@@ -31,7 +31,13 @@
     mol/L、体积 mL），以精确有理数求满足全部目标浓度的非负母液取用量
     （受可用体积与终体积约束，余量用水补足；多解时先取母液总量最小、再按
     输入顺序取用量字典序最小），返回各母液取用量、补水量与最终浓度；
-11. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+11. `/isotopes/envelope` 做**同位素名义质量峰分布**：提交化学式与每种
+    元素各同位素的名义质量数（正整数）与丰度（非负十进制字符串，每组精确
+    相加之和为 1），服务把每个原子视为独立抽样，以精确有理数枚举全部
+    名义质量组合并把同质量组合合并（不在合并前截断低/零概率组合），返回
+    按质量升序的全部峰（概率为最简分数字符串）与概率最高峰（并列取质量
+    较小者）；
+12. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -123,6 +129,21 @@ curl -X POST http://localhost:8000/api/v1/solutions/blend \
   }'
 ```
 
+同位素名义质量峰分布——Cl₂ 中 ³⁵Cl 占 3/4、³⁷Cl 占 1/4，得到 70/72/74
+三个峰，概率分别为 9/16、3/8、1/16：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "formula": "Cl2",
+    "isotopes": {
+      "Cl": [{"mass_number": 35, "abundance": "0.75"},
+             {"mass_number": 37, "abundance": "0.25"}]
+    }
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -135,7 +156,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 315 个测试
+pytest          # 364 个测试
 ```
 
 ---
@@ -153,6 +174,7 @@ pytest          # 315 个测试
 | POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：多步反应按顺序消耗/产出，逐步传递库存，返回各步明细与最终库存 |
 | POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
 | POST | `/api/v1/solutions/blend` | 溶液配制：不超过 4 种母液 + 目标终体积与各溶质目标浓度 → 满足全部目标浓度的最小母液取用量、补水量与最终浓度 |
+| POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 各元素同位素质量数/丰度 → 按质量升序的全部峰（最简分数概率）与概率最高峰（并列取质量较小者） |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -877,7 +899,93 @@ curl -X POST http://localhost:8000/api/v1/solutions/blend \
 
 该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
 
-### 2.10 幂等与查询
+### 2.10 同位素名义质量峰分布 `POST /api/v1/isotopes/envelope`
+
+提交一个**化学式**与其中**每种元素的同位素组**（名义质量数 + 丰度），服务把
+化学式中的每个原子视为一次**独立抽样**（同元素原子独立同分布）：
+
+* 对每种元素枚举 ``n`` 个原子在其 ``k`` 种同位素上的全部占有数组合
+  ``(c_1, …, c_k)``（``Σc_i = n``），组合概率取多项式分布
+  ``n!/(c_1!…c_k!) · Π p_i^c_i``，组合名义质量为 ``Σ c_i·m_i``；
+* **同质量的不同组合概率精确相加（合并）**——多元素之间再做质量分布的卷积；
+* **不在合并前截断低概率或零概率组合**（提前剪枝会漏掉与其它组合同质量
+  相加的项）；丰度为 0 的质量峰同样返回（概率为 `"0"`）；
+* 全部运算使用 ``fractions.Fraction``（不经过 float），概率以**最简分数
+  字符串**（``"9/16"``、``"1"``、``"0"``）返回；
+* 峰按**质量升序**排列；``most_intense_peak`` 为概率最高的峰，概率并列时
+  取**质量较小者**。
+
+请求体约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `formula` | 可解析的化学式（支持括号与离子电荷）；**电子物种 `e-` / `e+` / `e` 一律拒绝**；最多含 **3 种元素**、总原子数 **≤ 30** |
+| `isotopes` | 元素符号 → 同位素组的对象；必须为化学式中的**每种元素恰好给出一组**（无缺失、多余、未知元素） |
+| `isotopes[E][].mass_number` | **正整数**质量数；同一组内必须**互异**，每组 **1～3** 种同位素 |
+| `isotopes[E][].abundance` | **非负十进制字符串**（不要传 JSON 数字）；每组丰度必须**精确相加之和为 1**（按十进制精确比较，`0.1+0.2=0.3 ≠ 1`） |
+
+以 Cl₂（³⁵Cl 丰度 3/4、³⁷Cl 丰度 1/4）为例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "formula": "Cl2",
+    "isotopes": {
+      "Cl": [{"mass_number": 35, "abundance": "0.75"},
+             {"mass_number": 37, "abundance": "0.25"}]
+    }
+  }'
+```
+
+`200` 响应：
+
+```json
+{
+  "input": "Cl2",
+  "normalized": "Cl2",
+  "total_atoms": 2,
+  "peaks": [
+    {"mass": 70, "probability": "9/16"},
+    {"mass": 72, "probability": "3/8"},
+    {"mass": 74, "probability": "1/16"}
+  ],
+  "most_intense_peak": {"mass": 70, "probability": "9/16"}
+}
+```
+
+更复杂的例子——H₂O 中 H 取 ¹H/²H 各 1/2、O 取 ¹⁶O/¹⁸O 各 1/2，质量
+18～22 的五个峰概率为 1/8、1/4、1/4、1/4、1/8；中间三个峰并列最高，
+`most_intense_peak` 取质量最小的 19：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "formula": "H2O",
+    "isotopes": {
+      "H": [{"mass_number": 1, "abundance": "0.5"},
+            {"mass_number": 2, "abundance": "0.5"}],
+      "O": [{"mass_number": 16, "abundance": "0.5"},
+            {"mass_number": 18, "abundance": "0.5"}]
+    }
+  }'
+```
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 化学式无法解析（`details.field="formula"`） | `400 FORMULA_PARSE_ERROR` |
+| 电子物种（`details.electron_species`）、元素超过 3 种（`details.too_many_elements`）、总原子数超过 30（`details.too_many_atoms`） | `422 INVALID_ISOTOPES` |
+| 缺少元素组 / 多余元素 / 未知元素符号（`details.missing_elements` / `extra_elements` / `unknown_elements`） | `422 INVALID_ISOTOPES` |
+| 每组同位素超过 3 种（`details.too_many_isotopes`）、质量数重复（`details.duplicate_mass_numbers`）、质量数非正（`details.non_positive_mass_numbers`） | `422 INVALID_ISOTOPES` |
+| 丰度非法（负数/NaN/非数字；`details.invalid_abundances`）或一组丰度之和不精确等于 1（`details.abundance_sum_not_one`） | `422 INVALID_ISOTOPES` |
+| 丰度传成 JSON 数字、质量数非整数、同位素组为空列表、缺字段、空白化学式等请求体结构问题 | `422 INVALID_REQUEST` |
+
+该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
+
+### 2.11 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -958,6 +1066,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | `INVALID_INVENTORY` | 422 | `/inventory/allocate` 需求物种或批号重复、纯度不在 (0,1]、有效/名义摩尔数非法（含 JSON 数字）或批次状态未知，问题明细在 `details` 中聚合返回 |
 | `INVALID_BLEND` | 422 | `/solutions/blend` 母液标识或溶质重复、目标溶质重复、浓度/体积非法（含 JSON 数字）或目标终体积非正，问题明细在 `details` 中聚合返回 |
 | `NO_FEASIBLE_BLEND` | 422 | `/solutions/blend` 无可行解：在可用体积与终体积约束下不存在满足全部目标浓度的非负取用量（`details.insufficient_solutes` 给出单溶质供应诊断） |
+| `INVALID_ISOTOPES` | 422 | `/isotopes/envelope` 同位素定义非法：电子物种、元素/原子数超限、缺失/多余/未知元素、质量数非正或重复、丰度非法或每组和不精确为 1，问题明细在 `details` 中聚合返回 |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -984,10 +1093,11 @@ app/
   stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）、投料+实际产量 -> 理论/实际/收率百分比（收率计算）与多步连续反应库存推演，Decimal/Fraction 精确计算
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
+  isotopes.py       同位素名义质量峰分布：独立原子抽样的多项式枚举、同质量组合合并与多元素卷积，最简分数概率，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制共 315 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布共 364 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

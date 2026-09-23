@@ -807,3 +807,99 @@ class BlendResponse(BaseModel):
     final_concentrations: list[BlendSoluteResult] = Field(
         description="全部涉及溶质（目标 ∪ 母液带入）的最终浓度，按溶质标识排序"
     )
+
+
+# ------------------------------------------------------------ 同位素名义质量峰分布
+class IsotopeAbundance(BaseModel):
+    """一种同位素：名义质量数与该元素中对应的非负丰度（十进制字符串）。"""
+
+    mass_number: int = Field(
+        ...,
+        description="同位素名义质量数（正整数，如 12、13）；每组内不得重复",
+        examples=[12],
+    )
+    abundance: str = Field(
+        ...,
+        min_length=1,
+        description="该同位素的非负丰度十进制字符串（如 \"0.9893\"），"
+        "不要传 JSON 数字；同一组全部丰度必须精确相加之和为 1",
+        examples=["0.9893"],
+    )
+
+    @field_validator("abundance")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class IsotopeEnvelopeRequest(BaseModel):
+    """``POST /isotopes/envelope`` 请求：化学式 + 每种元素的同位素质量数与丰度。"""
+
+    formula: str = Field(
+        ...,
+        min_length=1,
+        description="目标化学式（支持元素、括号、电荷；不接受电子 e-/e+），如 \"H2O\"",
+        examples=["H2O"],
+    )
+    isotopes: dict[str, list[IsotopeAbundance]] = Field(
+        ...,
+        description="元素符号 -> 该元素的同位素组（1～3 种）；必须恰好覆盖化学式"
+        "中的每种元素（无缺失、多余、未知元素）；化学式最多含 3 种元素、"
+        "总原子数不超过 30",
+    )
+    # 字典本身的元素种数（键数）与每组同位素种数在 service 层做语义校验，
+    # 以聚合 INVALID_ISOTOPES 明细；这里仅约束每组列表非空且不超过 3 种。
+
+    @field_validator("formula")
+    @classmethod
+    def _strip_formula(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("化学式必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("化学式不能为空字符串")
+        return stripped
+
+    @field_validator("isotopes")
+    @classmethod
+    def _strip_element_keys(cls, value: dict[str, list[IsotopeAbundance]]) -> dict:
+        if not isinstance(value, dict):
+            raise ValueError("同位素定义必须是以元素符号为键的对象")
+        cleaned: dict[str, list[IsotopeAbundance]] = {}
+        for key, group in value.items():
+            if not isinstance(key, str):
+                raise ValueError("元素符号必须是字符串")
+            stripped = key.strip()
+            if not stripped:
+                raise ValueError("元素符号不能为空字符串")
+            if not group:
+                raise ValueError(f"元素 {stripped!r} 的同位素组不能为空")
+            cleaned[stripped] = group
+        return cleaned
+
+
+class IsotopePeak(BaseModel):
+    """一个名义质量峰：质量数（全体原子质量数之和）与最简分数概率。"""
+
+    mass: int = Field(description="名义质量（全体原子名义质量数之和）")
+    probability: str = Field(
+        description="出现概率的最简分数字符串，如 \"1/2\"、\"1\"、\"0\""
+    )
+
+
+class IsotopeEnvelopeResponse(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    total_atoms: int = Field(description="化学式中的总原子数（≤ 30）")
+    peaks: list[IsotopePeak] = Field(
+        description="全部名义质量峰，按质量升序；同质量组合已合并，"
+        "概率为最简分数字符串（包含概率为 0 的峰）"
+    )
+    most_intense_peak: IsotopePeak = Field(
+        description="概率最高的峰；多个峰并列最高时取质量较小者"
+    )
