@@ -31,7 +31,11 @@
     mol/L、体积 mL），以精确有理数求满足全部目标浓度的非负母液取用量
     （受可用体积与终体积约束，余量用水补足；多解时先取母液总量最小、再按
     输入顺序取用量字典序最小），返回各母液取用量、补水量与最终浓度；
-11. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+11. `/isotopes/envelope` 做**同位素名义质量峰分布**：提交化学式与每种元素
+    的同位素质量数、丰度（非负十进制字符串，每组和恰为 1），按独立原子
+    抽样（多项分布）枚举全部可能的名义质量与精确概率，同质量组合合并，
+    以最简分数字符串返回按质量升序的全部峰与最高概率峰（并列取质量较小者）；
+12. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -123,6 +127,24 @@ curl -X POST http://localhost:8000/api/v1/solutions/blend \
   }'
 ```
 
+同位素名义质量峰分布——HCl（氢 1H/2H 各 0.5，氯 35Cl 0.75、37Cl 0.25）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "formula": "HCl",
+    "elements": [
+      {"element": "H", "isotopes": [
+        {"mass_number": 1, "abundance": "0.5"},
+        {"mass_number": 2, "abundance": "0.5"}]},
+      {"element": "Cl", "isotopes": [
+        {"mass_number": 35, "abundance": "0.75"},
+        {"mass_number": 37, "abundance": "0.25"}]}
+    ]
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -135,7 +157,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 315 个测试
+pytest          # 379 个测试
 ```
 
 ---
@@ -153,6 +175,7 @@ pytest          # 315 个测试
 | POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：多步反应按顺序消耗/产出，逐步传递库存，返回各步明细与最终库存 |
 | POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
 | POST | `/api/v1/solutions/blend` | 溶液配制：不超过 4 种母液 + 目标终体积与各溶质目标浓度 → 满足全部目标浓度的最小母液取用量、补水量与最终浓度 |
+| POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 每元素同位素质量数/丰度 → 按质量升序的全部名义质量峰（最简分数概率）与最高概率峰 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -877,7 +900,106 @@ curl -X POST http://localhost:8000/api/v1/solutions/blend \
 
 该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
 
-### 2.10 幂等与查询
+### 2.10 同位素名义质量峰分布 `POST /api/v1/isotopes/envelope`
+
+提交一个**化学式**与**化学式中每种元素的一组同位素定义**（质量数 + 丰度），
+服务端把分子中的每个原子看作一次**独立**的同位素抽样：
+
+* 元素原子数沿用既有的递归下降解析器取得（支持括号、嵌套、下标与离子
+  电荷；**电子物种 `e-` / `e+` 拒绝**）；
+* 对含 n 个原子、k 种同位素（质量数 m₁..mₖ、丰度 p₁..pₖ）的元素，枚举
+  全部计数向量 (c₁,…,cₖ)（Σcᵢ = n），按**多项分布**给出质量 Σcᵢ·mᵢ 与
+  概率 n!/(c₁!…cₖ!)·p₁ᶜ¹…pₖᶜᵏ；再对各元素分布做卷积，**同质量组合
+  在全部枚举完成之后合并**——不截断任何低概率（含恰好为 0）的组合；
+* 全程使用精确有理数（丰度十进制字符串先无损转为 `Fraction`，不经过
+  `float`），峰概率以**最简分数字符串**返回（`"3/8"`、`"1"`、`"0"`）；
+* 返回 `peaks` 按**名义质量升序**排列，`most_probable` 为概率最高的峰，
+  **概率并列时取质量较小者**。
+
+请求约束：
+
+| 约束 | 上限 |
+| --- | --- |
+| 元素种类 | **至多 3 种**（化学式中出现的每种元素都必须恰好给出一组，不能缺失、重复或给出不存在的元素） |
+| 总原子数 | **不超过 30** |
+| 每组同位素种数 | **至多 3 种**，质量数必须是两两**互异的正整数** |
+| 丰度 | 均为**非负十进制字符串**（不要传 JSON 数字），同一组丰度**精确之和为 1**（允许某个丰度为 `"0"`，对应质量峰概率为 `"0"` 但仍返回） |
+
+请求示例（HCl：两个元素都只有 1 个原子，四个质量峰；质量 36 与 37
+概率并列 3/8，最高概率峰取质量较小者 36）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "formula": "HCl",
+    "elements": [
+      {"element": "H", "isotopes": [
+        {"mass_number": 1, "abundance": "0.5"},
+        {"mass_number": 2, "abundance": "0.5"}]},
+      {"element": "Cl", "isotopes": [
+        {"mass_number": 35, "abundance": "0.75"},
+        {"mass_number": 37, "abundance": "0.25"}]}
+    ]
+  }'
+```
+
+`200` 响应：
+
+```json
+{
+  "input": "HCl",
+  "normalized": "HCl",
+  "total_atoms": 2,
+  "elements": [
+    {"element": "H", "atom_count": 1, "isotopes": [
+      {"mass_number": 1, "abundance": "0.5"},
+      {"mass_number": 2, "abundance": "0.5"}]},
+    {"element": "Cl", "atom_count": 1, "isotopes": [
+      {"mass_number": 35, "abundance": "0.75"},
+      {"mass_number": 37, "abundance": "0.25"}]}
+  ],
+  "peaks": [
+    {"mass": 36, "probability": "3/8"},
+    {"mass": 37, "probability": "3/8"},
+    {"mass": 38, "probability": "1/8"},
+    {"mass": 39, "probability": "1/8"}
+  ],
+  "most_probable": {"mass": 36, "probability": "3/8"}
+}
+```
+
+`Cl2`（丰度 0.75/0.25）展示多项系数与最简分数：两个原子都是 35Cl
+概率 9/16；一个 35Cl 一个 37Cl 有两条抽样路径，合并为质量 72、
+概率 3/8；都是 37Cl 为 1/16。零丰度同位素（如
+`[{"mass_number":12,"abundance":"1"},{"mass_number":14,"abundance":"0"}]`）
+对应的质量峰以 `"0"` 概率保留返回。
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `normalized` | 规范化后的化学式（括号与电荷归一） |
+| `total_atoms` | 化学式总原子数（≤ 30） |
+| `elements[].atom_count` | 由解析器取得的该元素原子数 |
+| `peaks[]` | 全部名义质量峰，按质量升序，概率为最简分数字符串；同质量组合已合并，未截断低/零概率峰 |
+| `most_probable` | 概率最高的峰；概率并列时取质量较小者 |
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 化学式无法解析、**电子物种**（`details.field="formula"`） | `400 FORMULA_PARSE_ERROR` |
+| 元素组缺失（`details.missing_elements`）、重复（`duplicate_elements`）、给出化学式中不存在的元素（`unexpected_elements`）、元素符号非法（`invalid_elements`） | `422 INVALID_ISOTOPE` |
+| 质量数重复（`details.duplicate_mass_numbers`） | `422 INVALID_ISOTOPE` |
+| 丰度非法：负数、NaN、非数字（`details.invalid_abundances`） | `422 INVALID_ISOTOPE` |
+| 丰度之和不精确等于 1（`details.abundance_sums`，给出实际的最简分数和） | `422 INVALID_ISOTOPE` |
+| 元素种类超过 3 种（`details.element_count`）或总原子数超过 30（`details.total_atoms`） | `422 INVALID_ISOTOPE` |
+| 请求体缺字段、列表为空或超长、质量数非正整数、丰度传成 JSON 数字、空白字符串等结构问题 | `422 INVALID_REQUEST` |
+
+该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
+
+### 2.11 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -958,6 +1080,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | `INVALID_INVENTORY` | 422 | `/inventory/allocate` 需求物种或批号重复、纯度不在 (0,1]、有效/名义摩尔数非法（含 JSON 数字）或批次状态未知，问题明细在 `details` 中聚合返回 |
 | `INVALID_BLEND` | 422 | `/solutions/blend` 母液标识或溶质重复、目标溶质重复、浓度/体积非法（含 JSON 数字）或目标终体积非正，问题明细在 `details` 中聚合返回 |
 | `NO_FEASIBLE_BLEND` | 422 | `/solutions/blend` 无可行解：在可用体积与终体积约束下不存在满足全部目标浓度的非负取用量（`details.insufficient_solutes` 给出单溶质供应诊断） |
+| `INVALID_ISOTOPE` | 422 | `/isotopes/envelope` 同位素输入非法：元素组缺失/重复/多余/非法、质量数重复、丰度非法或精确之和不为 1、超过元素/原子数上限，问题明细在 `details` 中聚合返回 |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -984,10 +1107,11 @@ app/
   stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）、投料+实际产量 -> 理论/实际/收率百分比（收率计算）与多步连续反应库存推演，Decimal/Fraction 精确计算
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
+  isotopes.py       同位素名义质量峰分布：逐元素多项分布枚举全部计数向量（不截断零概率组合）、同质量合并、跨元素卷积，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制共 315 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布共 379 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

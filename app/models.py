@@ -807,3 +807,123 @@ class BlendResponse(BaseModel):
     final_concentrations: list[BlendSoluteResult] = Field(
         description="全部涉及溶质（目标 ∪ 母液带入）的最终浓度，按溶质标识排序"
     )
+
+
+# ------------------------------------------------------------ 同位素名义质量峰分布
+class IsotopeItem(BaseModel):
+    """一种同位素：正整数质量数与非负丰度十进制字符串。"""
+
+    mass_number: int = Field(
+        ...,
+        ge=1,
+        description="同位素名义质量数（正整数，如 ¹²C 的 12、³⁷Cl 的 37）",
+        examples=[12],
+    )
+    abundance: str = Field(
+        ...,
+        min_length=1,
+        description="该同位素的天然（或指定）丰度，**非负十进制字符串**"
+        "（如 \"0.9893\"、\"0\"、\"1e-3\"），不要传 JSON 数字；"
+        "同一元素各同位素丰度必须精确之和为 1",
+        examples=["0.9893"],
+    )
+
+    @field_validator("abundance")
+    @classmethod
+    def _strip_abundance(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("丰度必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("丰度不能为空白字符串")
+        return stripped
+
+
+class ElementIsotopesRequest(BaseModel):
+    """一种元素的同位素清单。"""
+
+    element: str = Field(
+        ...,
+        min_length=1,
+        description="元素符号（如 \"H\"、\"Cl\"），必须是化学式中实际出现的元素",
+        examples=["H"],
+    )
+    isotopes: list[IsotopeItem] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+        description="该元素的同位素，1～3 种；质量数必须两两互异且为正整数，"
+        "丰度均非负且精确之和为 1",
+    )
+
+    @field_validator("element")
+    @classmethod
+    def _strip_element(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("元素符号必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("元素符号不能为空白字符串")
+        return stripped
+
+
+class IsotopeEnvelopeRequest(BaseModel):
+    """``POST /isotopes/envelope`` 请求：化学式 + 每种元素的同位素质量数与丰度。"""
+
+    formula: str = Field(
+        ...,
+        min_length=1,
+        description="待计算的化学式（支持既有解析器的全部写法：括号、下标、电荷；"
+        "不接受电子物种 e-/e+）",
+        examples=["H2O"],
+    )
+    elements: list[ElementIsotopesRequest] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+        description="每种出现元素恰好一组同位素定义，1～3 种元素；"
+        "不得缺失、重复或给出化学式中不存在的元素",
+    )
+
+    @field_validator("formula")
+    @classmethod
+    def _strip_formula(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("化学式必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("化学式不能为空字符串")
+        return stripped
+
+
+class IsotopePeak(BaseModel):
+    """一个名义质量峰。"""
+
+    mass: int = Field(description="名义质量数（各原子质量数之和）")
+    probability: str = Field(
+        description="该名义质量出现的精确概率，最简分数字符串（如 \"3/4\"、\"1\"）"
+    )
+
+
+class IsotopeElementEcho(BaseModel):
+    """输入元素及其原子数、同位素清单的回显。"""
+
+    element: str = Field(description="元素符号")
+    atom_count: int = Field(description="该元素在化学式中的原子数（由解析器取得）")
+    isotopes: list[IsotopeItem] = Field(description="客户端提交的同位素清单（回显）")
+
+
+class IsotopeEnvelopeResponse(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    total_atoms: int = Field(description="化学式总原子数")
+    elements: list[IsotopeElementEcho] = Field(
+        description="各元素的原子数与同位素清单（与请求 elements 顺序一致）"
+    )
+    peaks: list[IsotopePeak] = Field(
+        description="全部名义质量峰，按质量升序；同质量组合已合并，"
+        "概率为最简分数字符串，未截断低/零概率峰"
+    )
+    most_probable: IsotopePeak = Field(
+        description="概率最高的峰；概率并列时取质量较小者"
+    )

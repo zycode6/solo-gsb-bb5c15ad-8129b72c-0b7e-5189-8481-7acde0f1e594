@@ -27,7 +27,15 @@ from .balancer import (
 )
 from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
-from .parser import FormulaError, parse_formula
+from .isotopes import (
+    MAX_ELEMENTS,
+    MAX_TOTAL_ATOMS,
+    ElementIsotopes,
+    Isotope,
+    isotope_envelope,
+    most_probable_peak,
+)
+from .parser import ELEMENTS as ELEMENT_SYMBOLS, FormulaError, parse_formula
 from .stoichiometry import (
     apply_sequence_step,
     compute_reverse_plan,
@@ -53,6 +61,7 @@ STATUS_CODES = {
     "INVALID_INVENTORY": 422,
     "INVALID_BLEND": 422,
     "NO_FEASIBLE_BLEND": 422,
+    "INVALID_ISOTOPE": 422,
 }
 
 
@@ -1313,4 +1322,197 @@ def process_blend(
             for stock, used in zip(stocks, solution.volumes)
         ],
         "final_concentrations": final_concentrations,
+    }
+
+
+# ------------------------------------------------------------ 同位素名义质量峰分布
+def process_isotope_envelope(
+    formula_text: str, element_items: list[dict[str, Any]]
+) -> tuple[int, dict[str, Any]]:
+    """同位素名义质量峰分布，返回 (http_status, payload)。
+
+    先用既有解析器 :func:`parse_formula` 取得各元素原子数（电子物种
+    拒绝，解析失败沿用 400 FORMULA_PARSE_ERROR）；随后聚合校验同位素
+    输入：每个出现元素恰好一组、不得重复或给出不存在的元素，每组
+    1～3 种互异正整数质量数，丰度均为非负十进制字符串且精确之和为 1，
+    元素种类至多 3、总原子数至多 30——全部语义问题聚合为 422
+    INVALID_ISOTOPE。校验通过后调用 :func:`app.isotopes.isotope_envelope`
+    按独立原子抽样（多项分布）枚举全部名义质量与概率，同质量组合在
+    枚举完成后合并，概率以最简分数字符串返回。该接口为无状态计算，
+    不读写幂等缓存。
+    """
+    try:
+        formula = parse_formula(formula_text)
+    except FormulaError as exc:
+        return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+            "error": error_payload(
+                "FORMULA_PARSE_ERROR",
+                str(exc),
+                {"field": "formula", "input": formula_text},
+            ),
+        }
+
+    if formula.is_electron:
+        return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+            "error": error_payload(
+                "FORMULA_PARSE_ERROR",
+                "同位素质量峰分布不支持电子物种（e- / e+）：请提交含元素的化学式",
+                {"field": "formula", "input": formula_text},
+            ),
+        }
+
+    composition = formula.composition
+    total_atoms = sum(composition.values())
+
+    # ---- 逐元素校验同位素组
+    specs: list[ElementIsotopes] = []
+    seen_elements: set[str] = set()
+    duplicate_elements: list[str] = []
+    invalid_elements: list[dict[str, str]] = []
+    unexpected_elements: list[dict[str, str]] = []
+    invalid_abundances: list[dict[str, Any]] = []
+    duplicate_mass_numbers: list[dict[str, Any]] = []
+    abundance_sums: list[dict[str, str]] = []
+
+    for item in element_items:
+        element = item["element"]
+        raw_isotopes = item["isotopes"]
+
+        if element in seen_elements:
+            duplicate_elements.append(element)
+        seen_elements.add(element)
+
+        if element not in ELEMENT_SYMBOLS:
+            invalid_elements.append({"element": element})
+            continue
+        if element not in composition:
+            unexpected_elements.append(
+                {"element": element, "formula": formula.normalized}
+            )
+            continue
+
+        seen_mass: set[int] = set()
+        duplicates_here: list[int] = []
+        isotopes: list[Isotope] = []
+        abundance_total = Fraction(0)
+        group_abundance_ok = True
+        for raw in raw_isotopes:
+            mass_number = raw["mass_number"]
+            abundance_text = raw["abundance"]
+            if mass_number in seen_mass and mass_number not in duplicates_here:
+                duplicates_here.append(mass_number)
+            seen_mass.add(mass_number)
+            try:
+                abundance = parse_moles(abundance_text)
+            except (ValueError, InvalidOperation):
+                invalid_abundances.append(
+                    {
+                        "element": element,
+                        "mass_number": mass_number,
+                        "abundance": abundance_text,
+                    }
+                )
+                group_abundance_ok = False
+                continue
+            fraction_abundance = decimal_to_fraction(abundance)
+            abundance_total += fraction_abundance
+            isotopes.append(Isotope(mass_number, fraction_abundance))
+
+        if duplicates_here:
+            duplicate_mass_numbers.append(
+                {"element": element, "mass_numbers": sorted(duplicates_here)}
+            )
+        # 仅当该组丰度全部可解析时才报告“和不为 1”，避免与单条非法丰度
+        # 的明细重复；和以最简分数渲染（0.5 + 0.5 -> "1"）
+        if group_abundance_ok and abundance_total != 1:
+            abundance_sums.append(
+                {"element": element, "sum": str(abundance_total)}
+            )
+
+        specs.append(
+            ElementIsotopes(
+                element=element,
+                atom_count=composition[element],
+                isotopes=tuple(isotopes),
+            )
+        )
+
+    # ---- 缺失元素：化学式中出现但未提交同位素组的元素
+    missing_elements = sorted(set(composition) - seen_elements)
+
+    too_many_elements = len(composition) > MAX_ELEMENTS
+    too_many_atoms = total_atoms > MAX_TOTAL_ATOMS
+
+    if (
+        invalid_elements
+        or duplicate_elements
+        or unexpected_elements
+        or missing_elements
+        or invalid_abundances
+        or duplicate_mass_numbers
+        or abundance_sums
+        or too_many_elements
+        or too_many_atoms
+    ):
+        details: dict[str, Any] = {}
+        if invalid_elements:
+            details["invalid_elements"] = invalid_elements
+        if duplicate_elements:
+            details["duplicate_elements"] = sorted(set(duplicate_elements))
+        if missing_elements:
+            details["missing_elements"] = missing_elements
+        if unexpected_elements:
+            details["unexpected_elements"] = unexpected_elements
+        if invalid_abundances:
+            details["invalid_abundances"] = invalid_abundances
+        if duplicate_mass_numbers:
+            details["duplicate_mass_numbers"] = duplicate_mass_numbers
+        if abundance_sums:
+            details["abundance_sums"] = abundance_sums
+        if too_many_elements:
+            details["element_count"] = len(composition)
+            details["max_elements"] = MAX_ELEMENTS
+        if too_many_atoms:
+            details["total_atoms"] = total_atoms
+            details["max_total_atoms"] = MAX_TOTAL_ATOMS
+        return STATUS_CODES["INVALID_ISOTOPE"], {
+            "error": error_payload(
+                "INVALID_ISOTOPE",
+                "同位素输入必须合法：化学式中的每种元素恰好给出一组同位素定义"
+                "（不得缺失、重复或给出不存在的元素，元素种类至多 3 种、总原子"
+                "数至多 30）；每组 1～3 种互异的正整数质量数，丰度均为非负"
+                "十进制字符串（不能为 JSON 数字）且精确之和为 1",
+                details,
+            ),
+        }
+
+    # 与请求顺序一致（前面已保证元素恰好一一对应）
+    ordered_specs = [
+        next(spec for spec in specs if spec.element == item["element"])
+        for item in element_items
+    ]
+
+    peaks = isotope_envelope(ordered_specs)
+    top = most_probable_peak(peaks)
+
+    def render_peak(peak) -> dict[str, Any]:
+        return {"mass": peak.mass, "probability": str(peak.probability)}
+
+    return 200, {
+        "input": formula_text,
+        "normalized": formula.normalized,
+        "total_atoms": total_atoms,
+        "elements": [
+            {
+                "element": item["element"],
+                "atom_count": composition[item["element"]],
+                "isotopes": [
+                    {"mass_number": iso["mass_number"], "abundance": iso["abundance"]}
+                    for iso in item["isotopes"]
+                ],
+            }
+            for item in element_items
+        ],
+        "peaks": [render_peak(peak) for peak in peaks],
+        "most_probable": render_peak(top),
     }
